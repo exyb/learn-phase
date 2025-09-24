@@ -1,0 +1,312 @@
+
+/**
+namespace、chroot这些系统调用其实就是Docker底层机制
+
+mkdir -p /tmp/newroot/bin
+/bin/cp /data/release-sync-to-minio/./build-essentials/utils/busybox-amd64 /tmp/newroot/bin/busybox
+/bin/cp /usr/bin/bash  /tmp/newroot/bin # 可能跑不起来bash
+sudo go run main.go run /bin/busybox sh
+
+/bin # ./busybox ls
+bash     busybox
+
+busybox ifconfig  网络没有隔离, 隔离了进程, pid, ns
+
+/bin # ./busybox ps
+PID   USER     TIME  COMMAND
+ps: can't open '/proc': No such file or directory
+**/
+
+/**
+可能是 chroot 目录不完整导致, 我现在把 alpine:3.18 镜像通过docker save 保存为tar, 然后解压tar到当前的unpack目录下, 帮我实现下面的功能:
+1. 通过类似docker的overlay2 加载为一个完整的 可以 chroot 的目录, 以这个作为最终的Chroot, 为容器生成一个id
+2. 实现 ps命令, 查看当前运行的容器id
+3. 实现 top 容器id 命令, 查看当前容器内的进程
+
+
+(default) [bobo@bobo-pc go-docker]$ sudo ./go-docker run alpine:3.18 /bin/sh
+解包镜像层 unpack/blobs/sha256/f44f286046d9443b2aeb895c0e1f4e688698247427bca4d15112c8e3432a803e 到 /tmp/container_1758123094793081339/lower
+挂载 overlay2 到 /tmp/container_1758123094793081339/merged
+启动容器 1758123094793081339，命令: [/bin/sh]
+容器启动成功，id: 1758123094793081339, pid: 112272
+(default) [bobo@bobo-pc go-docker]$ sudo ./go-docker ps
+{"id":"1758123094793081339","rootfs":"/tmp/container_1758123094793081339/merged","pid":112272}
+
+
+(default) [bobo@bobo-pc go-docker]$ sudo ./go-docker top 1758123094793081339
+容器 1758123094793081339 主进程 pid: 0
+(default) [bobo@bobo-pc go-docker]$
+**/
+
+/**
+(default) [bobo@bobo-pc go-docker]$ ps -ef
+Error, do this: mount -t proc proc /proc
+(default) [bobo@bobo-pc go-docker]$
+
+- 你的容器进程在 child() 里直接执行了 `syscall.Mount("proc", "/proc", "proc", 0, "")`，但没有使用 mount namespace 的隔离（即 CLONE_NEWNS），或者没有设置挂载为私有（MS_PRIVATE），导致对 /proc 的挂载操作影响了整个宿主机。
+
+- 挂载 namespace 没有隔离，容器内的 mount 操作会影响宿主机，导致 /proc 被卸载或覆盖。
+
+主机恢复: mount -t proc proc /proc
+**/
+
+/*
+为什么 /bin/sh 运行后, 没有命令提示符
+
+(default) [bobo@bobo-pc container_1758123509854784246]$ ls -l ./merged/bin/sh ./merged/bin/busybox
+-rwxr-xr-x 1 root root 816888 2024年 6月12日 ./merged/bin/busybox
+lrwxrwxrwx 1 root root     12 2025年 2月14日 ./merged/bin/sh -> /bin/busybox
+(default) [bobo@bobo-pc container_1758123509854784246]$
+
+仅绑定 stdin/stdout/stderr 不足以实现交互式容器，必须分配 pty  // 最简单的时候, busybox会自己进入tty的交互式
+你最早版本的代码能直接进入 busybox 交互终端，原因是它直接将宿主机的 stdin/stdout/stderr 绑定到容器进程，并且没有做复杂的 namespace、chroot、overlay2、挂载 proc、自动创建设备等操作，环境更接近于“裸进程”，busybox 能直接继承主机终端，正常交互。
+
+- 引入了 overlay2、chroot 到新 rootfs、自动创建设备、挂载 proc、mount namespace 隔离等，环境更“干净”，但也更容易缺失终端相关的依赖。
+
+- 集成 pty 虽然理论上能为容器分配伪终端，但如果 busybox 没有检测到 pty 或 rootfs 缺少 /dev/pts、/dev/ptmx 等，shell 依然会认为没有交互终端，直接退出或无提示符。
+
+- 你现在的 rootfs 可能没有挂载 /dev/pts（伪终端设备），导致 pty 分配后，容器内的 shell 依然无法正常工作。
+
+目前已排除 pty 兼容性问题，runWithMode() 采用了最原始的 stdin/stdout/stderr 绑定，主进程也阻塞等待子进程退出，但 busybox/sh 依然无法进入交互式。进一步分析：
+
+1. __终端类型识别问题__：busybox/sh 可能检测不到 tty，导致进入非交互模式直接退出。可以用 `tty` 命令测试主机终端类型（如 /dev/pts/2）。
+2. __chroot 后 /dev/tty、/dev/console、/dev/ptmx 设备节点权限或类型不对__，导致 shell 无法打开终端设备。
+3. __挂载 devpts 后，/dev/ptmx 是否为字符设备，major=5, minor=2__，否则 shell 无法分配伪终端。
+4. __主机终端与容器进程的 session/controlling tty 关系丢失__，Go 的 exec.Command 仅绑定文件描述符，无法自动分配 session leader 或 controlling tty。
+
+- 必须用 pty 分配伪终端，并将 pty 的 slave 端作为 child 进程的 stdin/stdout/stderr，且父进程保持 pty master 端与主机终端桥接。
+
+[container root@container /]# ^[[20;31R
+首次 run 进入容器时，/bin/sh 提示符出现 ^[[20;31R 乱码，原因如下：
+
+1. 该乱码是 shell（如 busybox/sh 或 bash）在检测终端窗口大小时，向终端发送 ESC [ 18 t 或 ESC [ 20 t 等控制序列，期望获得窗口尺寸响应。如果父进程未正确分配伪终端（pty）或未同步主机终端的窗口大小，shell 读到的就是原始的转义序列（^[[20;31R），导致提示符乱码。
+
+2. 你的 runWithMode 实现虽然用 ptyStart 分配了 pty，但没有监听主机终端窗口大小变化，也没有在启动时同步一次窗口大小。这样 shell 在启动时无法正确获取终端尺寸，导致输出异常。
+
+3. exec attach 进入容器时，Go 的 exec.Command 默认继承了主机终端，窗口大小是正确的，所以没有乱码。
+
+
+首次运行容器时，tty 仍出现 ^[[20;31R 乱码，说明终端窗口大小同步到 pty 的逻辑未完全生效。可能原因如下：
+
+1. 容器主进程启动后，pty 分配和窗口大小同步顺序正确，但 shell 启动时未能及时获取窗口尺寸，导致 shell 首次输出时仍收到原始 ESC 序列。
+2. Go 的 ptyStart(childCmd) 可能在 childCmd.Start() 之后才同步窗口大小，shell 已经初始化并输出提示符，窗口尺寸信息未能及时传递。
+3. 监听 SIGWINCH 信号后窗口变化能同步，但首次启动时窗口尺寸同步时机不够早。
+
+建议进一步优化：
+
+- 在 ptyStart 后，立即同步窗口大小，并确保在 childCmd.Start() 之前完成。
+- 或在 child 进程内（即 shell 启动前），主动触发一次窗口大小同步，确保 shell 能正确获取尺寸。
+
+
+*/
+
+/*
+*
+(default) [bobo@container go-docker]$ sudo go run main.go run alpine:3.18 /bin/sh
+go: downloading github.com/creack/pty v1.1.24
+^C
+(default) [bobo@container go-docker]$ go build -o go-docker main.go
+(default) [bobo@container go-docker]$ ./go-docker top 1758125172033391006
+容器 1758125172033391006 主进程 pid: 0
+(default) [bobo@container go-docker]$ ./go-docker ps
+(default) [bobo@container go-docker]$
+*/
+
+
+/*
+rm: 无法删除 '/tmp/container_1758125009278644898/merged': 设备或资源忙
+*/
+
+/**
+	// - 在主机环境下，/proc/self/exe 指向当前进程的可执行文件路径。
+	//  但在容器进程（chroot 到 merged 目录）后，/proc 目录是新挂载的 proc 文件系统，里面没有主机上的 /proc/self/exe 链接，导致 Go 无法找到自身可执行文件
+	// 不要在 chroot 环境下依赖 /proc/self/exe 路径。可以在 run 命令中，直接用 os.Executable() 获取当前可执行文件的绝对路径，并传递给 child 进程。
+
+  overlay          32G  197M   32G    1% /tmp/container_1758124866637096200/merged
+overlay          32G  197M   32G    1% /tmp/container_1758125009278644898/merged
+
+
+umount: /tmp/container_1758123933619415221/merged: 目标忙.
+
+
+在宿主机无法卸载 overlay2 挂载目录（如 /tmp/container_xxx/merged），即使 fuser/lsof 查不到进程占用，原因分析如下：
+
+1. __挂载点仍被占用__：即使容器主进程已退出，可能有残留的子进程（如 shell、后台任务）未被正确回收，或有文件描述符未关闭，导致挂载点处于“busy”状态，umount 失败。
+2. __挂载 namespace 隔离不彻底__：如果容器主进程未正确隔离 mount namespace（如未设置 MS_PRIVATE），容器内的挂载操作会影响宿主机，导致挂载点被主机进程持有，无法卸载。
+3. __Go 子进程未完全退出__：Go 的 exec/pty 机制可能导致父进程或 pty master 端仍持有挂载点，需确保所有相关进程和文件描述符都已关闭。
+4. __内核延迟释放资源__：部分 Linux 发行版在进程退出后，挂载点资源释放有延迟，可尝试多次 umount 或稍等后再操作。
+
+
+(default) [bobo@container go-docker]$ mount | grep overlay|grep merged
+overlay on /tmp/container_1758123094793081339/merged type overlay (rw,relatime,lowerdir=/tmp/container_1758123094793081339/lower,upperdir=/tmp/container_1758123094793081339/upper,workdir=/tmp/container_1758123094793081339/work,uuid=on)
+
+- __挂载点清理逻辑已实现__：runWithMode 非 daemon 模式下，容器主进程退出后会自动执行 syscall.Unmount(merged, 0) 和 os.RemoveAll(base)，理论上应能卸载 overlay2 挂载点并删除目录。
+
+- __可能导致挂载点无法卸载的代码问题__：
+
+  - __pty 未关闭或进程未完全退出__：如果 io.Copy 的 goroutine未及时退出，或 ptmx 文件描述符未完全关闭，可能导致挂载点仍被占用。建议在 ptmx.Close() 后，确保所有相关 goroutine和文件描述符都已关闭。
+  - __chroot 后 shell/子进程未退出__：如果容器内的 shell 或其它子进程未被正确回收，主进程 Wait() 返回后仍有残留进程持有挂载点，导致 umount 失败。可在清理前用 ps aux | grep merged 检查是否有残留进程。
+  - __挂载 namespace 隔离不彻底__：child 进程已设置 CLONE_NEWNS 并挂载为 MS_PRIVATE，理论上容器内挂载不会影响宿主机。但如有其它进程进入了容器的挂载 namespace，可能导致挂载点被其它进程持有。
+
+- __建议优化__：
+
+  - 在 runWithMode 清理挂载点前，主动 kill 容器主进程及所有子进程，确保无进程占用挂载点。
+  - 清理前多次尝试 syscall.Unmount(merged, 0)，如失败可用 syscall.Unmount(merged, syscall.MNT_DETACH)（懒卸载）。
+  - 在 prune 逻辑中也加入懒卸载（umount -l），确保所有挂载点都能被清理。
+  - 在清理后用 mount | grep overlay 检查是否有残留挂载点。
+
+*/
+
+
+/**
+帮我实现 stop 方法, 可以停止容器, 同时实现 rm方法, 可以删除容器的进程和资源, 包括容器的临时挂载目录
+*/
+
+
+/**
+拆分目录
+main.go:6:2: package go-docker/cmd is not in std (/home/bobo/go/1.22.12/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.7.linux-amd64/src/go-docker/cmd)
+
+module github.com/exyb/go-docker
+不能写 go-docker/cmd
+
+
+**/
+
+
+/**
+挂载 overlay2 到 /tmp/container_1758128236845451921/merged
+启动容器 1758128236845451921，命令: [/bin/sh]
+panic: exec: already started
+
+已定位并修复 "panic: exec: already started" 的根本原因：
+
+- 之前在交互式模式下，RunWithMode 同时调用了 pty.Start(childCmd) 和 childCmd.Start()，导致子进程被重复启动，Go 标准库直接 panic。
+- 现已去除 must(childCmd.Start())，只保留 pty.Start(childCmd)，确保 childCmd 只启动一次，彻底消除该错误。
+
+
+*/
+
+
+/**
+(default) [bobo@container go-docker]$ sudo ./go-docker ps
+[sudo] bobo 的密码：
+CONTAINER ID           PID      STATUS   ROOTFS
+1758128309006378762    188202   Running  /tmp/container_1758128309006378762/merged
+(default) [bobo@container go-docker]$ ps -ef|grep 188202
+root      188202  188195  0 00:58 pts/1    00:00:00 /bin/sh
+bobo      190133  189607  0 01:00 pts/8    00:00:00 grep --color=auto 188202
+(default) [bobo@container go-docker]$
+
+运行一个top进程, 说明主进程识别正常
+
+(default) [bobo@container go-docker]$ pstree -p 188202
+sh(188202)───top(190369)
+(default) [bobo@container go-docker]$
+
+现在 exec 进入容器后, 发现没有继承现有主进程的环境变量, 而且也没有挂载为 容器主进程的子进程
+
+你理解错了, 我说的主进程, 是child() 启动的这个容器进程, exec应该复制它的配置, 或者挂载为它的子进程
+child() 方法中有 	os.Setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin")
+
+
+/ # top
+top: no process info in /proc
+目前 exec 进入的容器, 为什么没有挂载 /proc ? 如果用 nsenter 是否可以解决这个问题, 帮我将 nsenter方式作为一种开关选项, 默认用nsenter实现
+
+*/
+
+
+/**
+(default) [bobo@container go-docker]$ sudo ./go-docker top 1758128309006378762
+容器 1758128309006378762 主进程 pid: 0
+(default) [bobo@container go-docker]$
+
+
+- 现有 ExecInContainer 实现是：进入主进程的 namespace，chroot 到 rootfs，然后 syscall.Exec(cmdArgs[0], cmdArgs, os.Environ())，环境变量仅为当前 go-docker 进程的环境。
+- 容器主进程（child）在启动时会设置一系列环境变量（os.Setenv），但 exec attach 进入时并未复用这些变量。
+- 进程关系：exec attach 进入容器后，实际上是 go-docker 的新进程，进入了主进程的 namespace，但不是主进程的子进程（pid tree分离），这与 docker exec 的行为类似，但如果你希望 exec 进程成为主进程的直接子进程，需要用特殊的进程注入技术（如 fork+setns+exec，或通过主进程内的代理/守护进程实现）。
+
+解决方案：
+
+1. __环境变量继承__：在 ExecInContainer attach 时，读取主进程的环境变量（/proc//environ），并设置到 os.Environ()，再 syscall.Exec(cmdArgs[0], cmdArgs, 新环境变量)。
+2. __进程树关系__：标准的 setns+exec attach 方式无法让新进程成为主进程的直接子进程（Linux 限制），除非主进程内有代理/守护进程，或用特殊的 ptrace/fork 技术。docker exec 也是独立进程，只是进入了 namespace。
+
+我希望top命令在现在的输出基础上, 输出容器内所有进程的 pid, 宿主机进程id, 容器命令和
+也打印容器内的 NSPPID , 比如容器内top进程pid是21, 其容器内的父进程是1
+
+
+
+*/
+
+
+/**
+帮我将容器id生成为类似docker的形式, 而且在exe结果中可以唯一的部分id选择到容器
+*/
+
+/**
+(default) [bobo@container go-docker]$ sudo ./go-docker run --daemon alpine:3.18 /bin/sh
+解包镜像层 unpack/blobs/sha256/f44f286046d9443b2aeb895c0e1f4e688698247427bca4d15112c8e3432a803e 到 /tmp/container_19260e2933f5/lower
+挂载 overlay2 到 /tmp/container_19260e2933f5/merged
+启动容器 19260e2933f5，命令: [/bin/sh]
+runWithMode: daemon 模式 child 启动，err=<nil>
+容器启动成功，id: 19260e2933f5, pid: 212212
+容器已在后台运行。请使用如下命令进入容器终端：
+./go-docker exec 19260e2933f5 /bin/sh
+(default) [bobo@container go-docker]$ ./go-docker exec 19260e2933f5 /bin/sh
+nsenter: cannot open /proc/212212/ns/ipc: No such file or directory
+exec: nsenter 失败: exit status 1
+
+
+有没有可能是 类似docker 的 -it  和tty有关?
+
+你的反馈很专业，确实和 Docker 的 -it（交互式+分配伪终端）/tty 选项有关。
+
+分析：
+
+- 在前台模式下，go-docker 会分配 pty（伪终端），容器主进程（如 /bin/sh）会保持交互式 shell，不会立即退出。
+- 在 daemon 模式下，没有分配 pty，/bin/sh 检测不到 tty，可能会立即退出（因为 shell 没有前台交互，或收到 SIGHUP）。
+- Docker 的 -it 选项就是为了解决这个问题：-i 保持标准输入，-t 分配 tty，保证 shell 不会因无 tty 而退出。
+
+解决方案：
+
+1. 在 daemon 模式下，启动 child 进程时也分配一个伪终端（pty），即使没有前台交互，也能让 /bin/sh 检测到 tty，从而保持存活。
+2. 或者在 daemon 模式下，默认执行一个不会退出的命令（如 sleep 1000），而不是 /bin/sh。
+3. 还可以在 child() 里检测，如果没有 tty，则强制执行 /bin/sh -c "while true; do sleep 1000; done"。
+
+下一步：建议在 daemon 模式下也分配 pty，或默认执行 sleep，保证容器主进程不会因无 tty 而退出。
+
+
+
+我不想默认执行sleep, 而是 在 daemon 模式下也分配 pty
+
+的反馈很关键：
+
+- 虽然 daemon 模式分配了 pty，但 /bin/sh 还是会退出，和 docker 的 -it -d 行为不一致。
+- Docker 的 -it -d 模式下，后台容器 shell 会一直存活，除非主动 exit。
+
+分析原因：
+
+1. 在 go-docker 的 daemon 模式下，虽然分配了 pty，但没有任何进程与 pty 交互（没有数据流），/bin/sh 可能检测到 EOF 或 SIGHUP 后自动退出。
+2. Docker 的后台容器会将 pty 挂载到 /dev/console 或 /dev/tty，并且有守护进程持有 pty，shell 不会收到 EOF/SIGHUP。
+3. go-docker 的 daemon 模式下，分配的 pty 只是临时的，childCmd 启动后就关闭了 pty（ptmx.Close()），导致 shell 失去控制终端，收到 SIGHUP 或 EOF 后退出。
+
+解决方案：
+
+- daemon 模式下，分配 pty 后，主进程必须一直持有 pty（不要关闭 ptmx），即使没有交互，也要保持 pty 句柄不被关闭。
+- 可以用一个 goroutine 持有 pty，持续读写（即使不做任何事），防止 shell 检测到 EOF。
+- 这样行为才与 docker -it -d 一致，后台 shell 不会自动退出。
+
+进一步分析：
+
+1. /bin/sh 在没有前台交互时，可能会因 SIGHUP 或检测到 pty 没有控制终端而自动退出。
+2. Docker 的 -d -it 模式下，后台 shell 能存活，是因为容器 init 进程会持有 pty，并将其挂载为 /dev/console 或 /dev/tty，shell 的控制终端就是这个 pty。
+3. go-docker 目前只是分配了 pty，但没有将 pty 设为 shell 的控制终端（即没有 setsid + ioctl TIOCSCTTY），导致 shell 认为没有控制终端，自动退出。
+
+修复方案：
+
+- 在 childCmd 启动前，需为其分配 pty，并将 pty 设为控制终端（setsid + ioctl TIOCSCTTY），让 shell 认为自己有 tty。
+- 具体做法：用 syscall.Setsid() 创建新会话，然后用 ioctl TIOCSCTTY 设为控制终端。
+- 可以用 github.com/creack/pty 的 StartWithAttrs，或手动实现 setsid+TIOCSCTTY。
+
+*/
